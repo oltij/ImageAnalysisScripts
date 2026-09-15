@@ -1,0 +1,56 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Application Fiji
+    Plugin BigStitcher
+    Purpose Headless BigStitcher processing
+
+%environment
+    export FIJI_HOME=/opt/Fiji.app
+    export PATH=$FIJI_HOME:$PATH
+    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+%post
+
+    apt-get update && apt-get install -y \
+        wget \
+        unzip \
+        ca-certificates \
+        openjdk-21-jre-headless \
+        xvfb \
+        && rm -rf /var/lib/apt/lists/*
+
+    cd /opt
+
+    wget -O Fiji.zip \
+        https://downloads.imagej.net/fiji/latest/fiji-latest-linux64-jdk.zip
+
+    unzip Fiji.zip
+    rm Fiji.zip
+
+    mv Fiji Fiji.app
+
+    # Remove bundled Zulu JDK to reduce size
+    rm -rf /opt/Fiji.app/java
+
+    test -x /opt/Fiji.app/fiji-linux-x64
+
+    cd /opt/Fiji.app
+
+    ./fiji-linux-x64 \
+        --headless \
+        --update update-site BigStitcher \
+        --no-splash || true
+
+    ./fiji-linux-x64 \
+        --headless \
+        --update \
+        --no-splash || true
+
+    chmod -R a+rX /opt/Fiji.app
+
+
+%runscript
+
+exec /opt/Fiji.app/fiji-linux-x64 "$@"
