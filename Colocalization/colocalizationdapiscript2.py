@@ -51,6 +51,56 @@ RESULTS_FILE = Path(
 OUTPUT_DIR = RESULTS_FILE.parent / "visualizations"
 
 # ------------------------------------------------------------
+# Optional marker-positive AREA as a percentage of organoid area
+# ------------------------------------------------------------
+# This adds area-based summary metrics such as:
+#     total LHX6-positive ROI area / total organoid area * 100
+#     total PV-positive ROI area   / total organoid area * 100
+#
+# ORGANOID_MEASUREMENTS_CSV should be the CellProfiler object-level CSV
+# containing the organoid ROI measurement(s). CellProfiler AreaShape_Area
+# is interpreted as an area in image pixels; if multiple organoid rows are
+# present, their areas are summed.
+ENABLE_ORGANOID_AREA_SUMMARY = True
+ORGANOID_MEASUREMENTS_CSV = Path(
+    "/home/oltij/Desktop/LHX6Image/MyExpt_FilterObjects.csv"
+)
+ORGANOID_AREA_COLUMN = "AreaShape_Area"
+
+# ------------------------------------------------------------
+# Optional TRUE all-cell summary using PRE-EXISTING nuclear assignments
+# ------------------------------------------------------------
+# Keep this enabled to calculate A+/B+, A+/B-, A-/B+, and A-/B-
+# as percentages of ALL nuclear ROIs, WITHOUT re-matching either marker
+# to Hoechst/DAPI in this visualization script.
+ENABLE_NUCLEAR_ALL_CELL_SUMMARY = True
+
+# IMPORTANT:
+# Point these to the TWO original marker-vs-nuclear HDF5 files produced by
+# 01_run_colocalization.py before the current marker-vs-marker run.
+#
+# Example conceptual runs:
+#     OBJECT_A_NUCLEAR_RESULTS_FILE = LHX6 <-> Hoechst/DAPI analysis HDF5
+#     OBJECT_B_NUCLEAR_RESULTS_FILE = PV   <-> Hoechst/DAPI analysis HDF5
+#
+# Leave either as None only if you want the all-cell summary skipped.
+OBJECT_A_NUCLEAR_RESULTS_FILE = Path(
+    "/home/oltij/Desktop/Aligned_DAPILHX6_colocalization_results_25_new/"
+    "Aligned_DAPILHX6_colocalization_analysis.h5"
+)
+OBJECT_B_NUCLEAR_RESULTS_FILE = Path(
+    "/home/oltij/Desktop/Aligned_DAPIPV_colocalization_results_25_new/"
+    "Aligned_DAPIPV_colocalization_analysis.h5"
+)
+
+# Nuclear denominator handling:
+# - identical nuclear ObjectID sets -> use that shared set
+# - one set is a strict subset of the other -> use the union/larger set
+# - partially different, non-nested sets -> stop, because that suggests
+#   incompatible nuclear segmentations / ID namespaces
+ALLOW_NESTED_NUCLEAR_OBJECT_SETS = True
+
+# ------------------------------------------------------------
 # Matched-pair / below-threshold visualization
 # ------------------------------------------------------------
 
@@ -3257,7 +3307,22 @@ unmatched_class_metrics_csv = UNMATCHED_QC_DIR / (
 )
 
 class_counts_csv = UNMATCHED_QC_DIR / (
-    f"{output_prefix}_final_unmatched_class_counts.csv"
+    f"{output_prefix}_final_class_counts.csv"
+)
+
+# One-row population-level summary containing marker-relative assignment
+# percentages and the final A+/B+, A+/B-, A-/B+ class composition.
+summary_metrics_csv = UNMATCHED_QC_DIR / (
+    f"{output_prefix}_final_summary_metrics.csv"
+)
+
+# Per-nucleus classification and four-class all-cell summary.
+nuclear_cell_classification_csv = UNMATCHED_QC_DIR / (
+    f"{output_prefix}_all_nuclear_cells_classification.csv"
+)
+
+all_cell_class_counts_csv = UNMATCHED_QC_DIR / (
+    f"{output_prefix}_all_nuclear_cells_class_counts.csv"
 )
 
 class_bin_summary_csv = UNMATCHED_QC_DIR / (
@@ -3790,27 +3855,839 @@ unmatched_class_metrics_df.to_csv(
     index=False
 )
 
-pd.DataFrame(
+# ------------------------------------------------------------
+# Population-level class / assignment summary
+# ------------------------------------------------------------
+# Because the final matching is one-to-one, every retained match is one
+# inferred double-positive cell (Object A+ / Object B+). The remaining
+# Object-A and Object-B ROIs form the two single-positive classes.
+
+n_a_only = len(a_only_ids)
+n_b_only = len(b_only_ids)
+n_double_positive = len(matching_df)
+n_final_classified_cells = (
+    n_double_positive + n_a_only + n_b_only
+)
+
+def _safe_percent(numerator, denominator):
+    if denominator == 0:
+        return np.nan
+    return 100.0 * float(numerator) / float(denominator)
+
+
+def _unique_positive_area_pixels(pixel_groups):
+    """Return the union area, in pixels, occupied by all ROIs in one marker.
+
+    Using a union mask prevents accidental double-counting if two ROI pixel
+    lists ever overlap. Coordinates outside the image are ignored.
+    """
+    positive_mask = np.zeros(
+        (image_height, image_width),
+        dtype=bool,
+    )
+
+    for pixels in pixel_groups.values():
+        if pixels is None or len(pixels) == 0:
+            continue
+
+        pixels = np.asarray(pixels, dtype=int)
+        xs = pixels[:, 0]
+        ys = pixels[:, 1]
+
+        valid = (
+            (xs >= 0)
+            & (xs < image_width)
+            & (ys >= 0)
+            & (ys < image_height)
+        )
+
+        positive_mask[ys[valid], xs[valid]] = True
+
+    return int(np.count_nonzero(positive_mask))
+
+
+def _load_organoid_area_pixels(csv_path, area_column):
+    """Load total CellProfiler organoid AreaShape_Area in image pixels."""
+    csv_path = Path(csv_path)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            "Organoid measurement CSV not found:\n"
+            f"{csv_path}"
+        )
+
+    organoid_df = pd.read_csv(csv_path)
+
+    if area_column not in organoid_df.columns:
+        area_like_columns = [
+            c for c in organoid_df.columns
+            if "area" in str(c).lower()
+        ]
+        raise ValueError(
+            f"Organoid area column '{area_column}' was not found in:\n"
+            f"{csv_path}\n"
+            f"Area-like columns found: {area_like_columns}"
+        )
+
+    areas = pd.to_numeric(
+        organoid_df[area_column],
+        errors="coerce",
+    )
+    areas = areas[np.isfinite(areas) & (areas > 0)]
+
+    if len(areas) == 0:
+        raise ValueError(
+            f"No positive finite values were found in '{area_column}' of:\n"
+            f"{csv_path}"
+        )
+
+    return float(areas.sum()), int(len(areas))
+
+
+# ------------------------------------------------------------
+# Marker-positive area / total organoid area summary
+# ------------------------------------------------------------
+# The numerator is the UNION of all current marker ROI pixels for that
+# marker. The denominator is the total CellProfiler organoid AreaShape_Area.
+# These calculations are independent of A/B matching and therefore include
+# both matched and unmatched positive marker ROIs.
+object_a_positive_area_pixels = np.nan
+object_b_positive_area_pixels = np.nan
+object_a_positive_area_um2 = np.nan
+object_b_positive_area_um2 = np.nan
+organoid_area_pixels = np.nan
+organoid_area_um2 = np.nan
+object_a_positive_area_percent_of_organoid = np.nan
+object_b_positive_area_percent_of_organoid = np.nan
+organoid_roi_count = np.nan
+
+if ENABLE_ORGANOID_AREA_SUMMARY:
+    organoid_area_pixels, organoid_roi_count = _load_organoid_area_pixels(
+        ORGANOID_MEASUREMENTS_CSV,
+        ORGANOID_AREA_COLUMN,
+    )
+
+    object_a_positive_area_pixels = _unique_positive_area_pixels(
+        a_pixel_groups
+    )
+    object_b_positive_area_pixels = _unique_positive_area_pixels(
+        b_pixel_groups
+    )
+
+    organoid_area_um2 = organoid_area_pixels * PIXEL_AREA_UM2
+    object_a_positive_area_um2 = (
+        object_a_positive_area_pixels * PIXEL_AREA_UM2
+    )
+    object_b_positive_area_um2 = (
+        object_b_positive_area_pixels * PIXEL_AREA_UM2
+    )
+
+    object_a_positive_area_percent_of_organoid = _safe_percent(
+        object_a_positive_area_pixels,
+        organoid_area_pixels,
+    )
+    object_b_positive_area_percent_of_organoid = _safe_percent(
+        object_b_positive_area_pixels,
+        organoid_area_pixels,
+    )
+
+    print()
+    print("=" * 70)
+    print("MARKER-POSITIVE AREA / ORGANOID AREA")
+    print("=" * 70)
+    print(
+        f"Organoid area: {organoid_area_pixels:,.0f} px | "
+        f"{organoid_area_um2:,.2f} um^2 "
+        f"({int(organoid_roi_count)} organoid ROI row(s))"
+    )
+    print(
+        f"{OBJECT_A_NAME}+ area: "
+        f"{object_a_positive_area_pixels:,.0f} px | "
+        f"{object_a_positive_area_um2:,.2f} um^2 | "
+        f"{object_a_positive_area_percent_of_organoid:.3f}% of organoid"
+    )
+    print(
+        f"{OBJECT_B_NAME}+ area: "
+        f"{object_b_positive_area_pixels:,.0f} px | "
+        f"{object_b_positive_area_um2:,.2f} um^2 | "
+        f"{object_b_positive_area_percent_of_organoid:.3f}% of organoid"
+    )
+
+# Final three-class composition. This file now contains the double-positive
+# class as well as both single-positive classes.
+class_counts_df = pd.DataFrame(
     [
         {
-            "Class": f"{OBJECT_A_NAME} only / not final matched",
-            "Count": len(a_only_ids),
+            "Class": f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+",
+            "Count": n_double_positive,
+            "Percent_of_Final_Classified_Cells": _safe_percent(
+                n_double_positive, n_final_classified_cells
+            ),
         },
         {
-            "Class": f"{OBJECT_B_NAME} only / not final matched",
-            "Count": len(b_only_ids),
+            "Class": f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-",
+            "Count": n_a_only,
+            "Percent_of_Final_Classified_Cells": _safe_percent(
+                n_a_only, n_final_classified_cells
+            ),
+        },
+        {
+            "Class": f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+",
+            "Count": n_b_only,
+            "Percent_of_Final_Classified_Cells": _safe_percent(
+                n_b_only, n_final_classified_cells
+            ),
         },
     ]
-).to_csv(
+)
+
+class_counts_df.to_csv(
     class_counts_csv,
     index=False
 )
 
-print(
-    f"\nFinal unmatched classes: "
-    f"{OBJECT_A_NAME}-only={len(a_only_ids):,}, "
-    f"{OBJECT_B_NAME}-only={len(b_only_ids):,}"
+# One-row headline summary. The first four percentages use each marker's own
+# ROI count as the denominator. The three marker-positive composition
+# percentages use A+/B+ + A+/B- + A-/B+ as the denominator.
+summary_metrics_record = {
+    "Object_A_Name": OBJECT_A_NAME,
+    "Object_B_Name": OBJECT_B_NAME,
+    "Object_A_Total_ROIs": total_a_objects,
+    "Object_B_Total_ROIs": total_b_objects,
+    "Double_Positive_Count": n_double_positive,
+    "Object_A_Only_Count": n_a_only,
+    "Object_B_Only_Count": n_b_only,
+    "Final_Classified_Cell_Count": n_final_classified_cells,
+    "Object_A_Assigned_to_Object_B_Percent": _safe_percent(
+        n_double_positive, total_a_objects
+    ),
+    "Object_A_Not_Assigned_to_Object_B_Percent": _safe_percent(
+        n_a_only, total_a_objects
+    ),
+    "Object_B_Assigned_to_Object_A_Percent": _safe_percent(
+        n_double_positive, total_b_objects
+    ),
+    "Object_B_Not_Assigned_to_Object_A_Percent": _safe_percent(
+        n_b_only, total_b_objects
+    ),
+    "Double_Positive_Label": f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+",
+    "Double_Positive_Percent_of_Final_Classified_Cells": _safe_percent(
+        n_double_positive, n_final_classified_cells
+    ),
+    "Object_A_Only_Label": f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-",
+    "Object_A_Only_Percent_of_Final_Classified_Cells": _safe_percent(
+        n_a_only, n_final_classified_cells
+    ),
+    "Object_B_Only_Label": f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+",
+    "Object_B_Only_Percent_of_Final_Classified_Cells": _safe_percent(
+        n_b_only, n_final_classified_cells
+    ),
+    # Area-based marker coverage of the organoid.
+    "Organoid_Area_Source_CSV": (
+        str(ORGANOID_MEASUREMENTS_CSV)
+        if ENABLE_ORGANOID_AREA_SUMMARY
+        else None
+    ),
+    "Organoid_Area_Column": (
+        ORGANOID_AREA_COLUMN
+        if ENABLE_ORGANOID_AREA_SUMMARY
+        else None
+    ),
+    "Organoid_ROI_Count": organoid_roi_count,
+    "Organoid_Area_Pixels": organoid_area_pixels,
+    "Organoid_Area_um2": organoid_area_um2,
+    "Object_A_Positive_Area_Pixels": object_a_positive_area_pixels,
+    "Object_A_Positive_Area_um2": object_a_positive_area_um2,
+    "Object_A_Positive_Area_Percent_of_Organoid": (
+        object_a_positive_area_percent_of_organoid
+    ),
+    "Object_B_Positive_Area_Pixels": object_b_positive_area_pixels,
+    "Object_B_Positive_Area_um2": object_b_positive_area_um2,
+    "Object_B_Positive_Area_Percent_of_Organoid": (
+        object_b_positive_area_percent_of_organoid
+    ),
+}
+
+
+# ============================================================
+# TRUE ALL-CELL SUMMARY USING PRE-EXISTING NUCLEAR ASSIGNMENTS
+# ============================================================
+# This section DOES NOT perform any new marker-to-nucleus spatial matching.
+# Instead it reuses the first-stage marker-vs-nuclear results already stored
+# by 01_run_colocalization.py.
+#
+# Why this matters:
+#   - Pairwise CellID is run-local and is assigned sequentially.
+#   - The canonical cross-run identity is the nuclear ObjectID from the
+#     original marker-vs-nuclear stable match.
+#
+# For each current marker object, this section attempts to recover its
+# canonical nuclear ObjectID from the corresponding source HDF5. It supports
+# either of the two normal pipeline situations:
+#   1. current ObjectID is still the original marker ROI/ObjectID; or
+#   2. the current input table carries the first-stage run-local CellID.
+#
+# Once Object A and Object B are both mapped to canonical nuclear ObjectIDs,
+# every nucleus is classified as exactly one of:
+#     A+/B+, A+/B-, A-/B+, A-/B-
+# and those four percentages use ALL nuclei as the denominator.
+
+
+def _normalize_name(value):
+    return str(value).strip().lower().replace(" ", "")
+
+
+def _load_source_nuclear_assignment_h5(results_file, expected_marker_name):
+    """Load one marker-vs-nuclear HDF5 and expose canonical nucleus mapping."""
+    results_file = Path(results_file)
+    if not results_file.exists():
+        raise FileNotFoundError(
+            f"Source marker-vs-nuclear analysis file not found:\n{results_file}"
+        )
+
+    with h5py.File(results_file, "r") as h5:
+        source_metadata = json.loads(
+            h5["metadata/json"][()].decode("utf-8")
+        )
+        source_mapping = dataframe_from_h5(h5, "cell_id_mapping")
+        source_object_a = dataframe_from_h5(h5, "object_a_pixels")
+        source_object_b = dataframe_from_h5(h5, "object_b_pixels")
+
+    source_a_name = source_metadata["objects"]["object_a_name"]
+    source_b_name = source_metadata["objects"]["object_b_name"]
+
+    expected_norm = _normalize_name(expected_marker_name)
+    a_norm = _normalize_name(source_a_name)
+    b_norm = _normalize_name(source_b_name)
+
+    if a_norm == expected_norm and b_norm != expected_norm:
+        marker_side = "A"
+        marker_id_col = "A_ObjectID"
+        nuclear_id_col = "B_ObjectID"
+        nuclear_table = source_object_b
+        nuclear_name = source_b_name
+    elif b_norm == expected_norm and a_norm != expected_norm:
+        marker_side = "B"
+        marker_id_col = "B_ObjectID"
+        nuclear_id_col = "A_ObjectID"
+        nuclear_table = source_object_a
+        nuclear_name = source_a_name
+    else:
+        raise ValueError(
+            "Could not uniquely identify the marker side in source HDF5.\n"
+            f"Expected marker: {expected_marker_name}\n"
+            f"Source objects: A={source_a_name}, B={source_b_name}\n"
+            f"File: {results_file}"
+        )
+
+    required_cols = {"CellID", marker_id_col, nuclear_id_col}
+    missing = required_cols - set(source_mapping.columns)
+    if missing:
+        raise ValueError(
+            f"Source cell_id_mapping is missing {sorted(missing)} in {results_file}"
+        )
+
+    mapping = source_mapping[["CellID", marker_id_col, nuclear_id_col]].copy()
+    mapping = mapping.rename(
+        columns={
+            "CellID": "Source_CellID",
+            marker_id_col: "Source_Marker_ObjectID",
+            nuclear_id_col: "Nuclear_ObjectID",
+        }
+    )
+
+    for col in ["Source_CellID", "Source_Marker_ObjectID", "Nuclear_ObjectID"]:
+        mapping[col] = pd.to_numeric(mapping[col], errors="raise").astype(int)
+
+    nuclear_ids = set(
+        pd.to_numeric(nuclear_table["ObjectID"], errors="raise").astype(int)
+    )
+
+    if not nuclear_ids:
+        raise ValueError(
+            f"No nuclear ObjectIDs were found in source HDF5: {results_file}"
+        )
+
+    return {
+        "results_file": results_file,
+        "metadata": source_metadata,
+        "marker_side": marker_side,
+        "marker_name": expected_marker_name,
+        "nuclear_name": nuclear_name,
+        "mapping": mapping,
+        "nuclear_ids": nuclear_ids,
+    }
+
+
+def _unique_current_object_to_original_column(current_table, column_name):
+    """Return current ObjectID -> selected preserved input-ID column."""
+    if column_name not in current_table.columns:
+        return None
+
+    pairs = current_table[["ObjectID", column_name]].dropna().drop_duplicates()
+    pairs["ObjectID"] = pd.to_numeric(
+        pairs["ObjectID"], errors="raise"
+    ).astype(int)
+    pairs[column_name] = pd.to_numeric(
+        pairs[column_name], errors="raise"
+    ).astype(int)
+
+    counts = pairs.groupby("ObjectID")[column_name].nunique()
+    bad = counts[counts != 1]
+    if len(bad):
+        raise ValueError(
+            f"Current table has ObjectIDs linked to multiple {column_name} values: "
+            f"{bad.index.astype(int).tolist()[:10]}"
+        )
+
+    return dict(zip(pairs["ObjectID"], pairs[column_name]))
+
+
+def _map_current_objects_to_canonical_nuclei(
+    current_table,
+    current_object_ids,
+    source_info,
+    marker_name,
+):
+    """
+    Map current marker objects back to source canonical nuclear ObjectIDs.
+
+    Preference order:
+      1. Direct original marker ObjectID match.
+      2. Preserved source CellID column in current object table.
+      3. Current ObjectID itself as source CellID (when prior exported data
+         contained only CellID/X/Y and the loader promoted CellID to ObjectID).
+    """
+    source_mapping = source_info["mapping"].copy()
+
+    by_marker_id = dict(
+        zip(
+            source_mapping["Source_Marker_ObjectID"].astype(int),
+            source_mapping["Nuclear_ObjectID"].astype(int),
+        )
+    )
+    by_source_cellid = dict(
+        zip(
+            source_mapping["Source_CellID"].astype(int),
+            source_mapping["Nuclear_ObjectID"].astype(int),
+        )
+    )
+
+    current_ids = sorted(int(x) for x in current_object_ids)
+    current_id_set = set(current_ids)
+
+    # Route 1: current ObjectID is the original marker ROI/ObjectID.
+    if current_id_set.issubset(set(by_marker_id)):
+        rows = [
+            {
+                "Current_ObjectID": object_id,
+                "Source_Link_Method": "current_ObjectID_to_source_marker_ObjectID",
+                "Source_Marker_ObjectID": object_id,
+                "Source_CellID": int(
+                    source_mapping.loc[
+                        source_mapping["Source_Marker_ObjectID"] == object_id,
+                        "Source_CellID",
+                    ].iloc[0]
+                ),
+                "Nuclear_ObjectID": int(by_marker_id[object_id]),
+            }
+            for object_id in current_ids
+        ]
+        return pd.DataFrame(rows)
+
+    # Route 2: source CellID was preserved as a column in the current table.
+    current_to_source_cellid = _unique_current_object_to_original_column(
+        current_table, "CellID"
+    )
+    if current_to_source_cellid is not None:
+        source_cellids_needed = {
+            int(current_to_source_cellid[x]) for x in current_ids
+        }
+        if source_cellids_needed.issubset(set(by_source_cellid)):
+            source_cellid_to_marker = dict(
+                zip(
+                    source_mapping["Source_CellID"].astype(int),
+                    source_mapping["Source_Marker_ObjectID"].astype(int),
+                )
+            )
+            rows = []
+            for object_id in current_ids:
+                source_cellid = int(current_to_source_cellid[object_id])
+                rows.append(
+                    {
+                        "Current_ObjectID": object_id,
+                        "Source_Link_Method": "preserved_CellID_to_source_CellID",
+                        "Source_Marker_ObjectID": int(
+                            source_cellid_to_marker[source_cellid]
+                        ),
+                        "Source_CellID": source_cellid,
+                        "Nuclear_ObjectID": int(
+                            by_source_cellid[source_cellid]
+                        ),
+                    }
+                )
+            return pd.DataFrame(rows)
+
+    # Route 3: current ObjectID itself may be the prior run's CellID.
+    if current_id_set.issubset(set(by_source_cellid)):
+        source_cellid_to_marker = dict(
+            zip(
+                source_mapping["Source_CellID"].astype(int),
+                source_mapping["Source_Marker_ObjectID"].astype(int),
+            )
+        )
+        rows = [
+            {
+                "Current_ObjectID": object_id,
+                "Source_Link_Method": "current_ObjectID_to_source_CellID",
+                "Source_Marker_ObjectID": int(
+                    source_cellid_to_marker[object_id]
+                ),
+                "Source_CellID": object_id,
+                "Nuclear_ObjectID": int(by_source_cellid[object_id]),
+            }
+            for object_id in current_ids
+        ]
+        return pd.DataFrame(rows)
+
+    missing_marker = sorted(current_id_set - set(by_marker_id))[:10]
+    missing_cellid = sorted(current_id_set - set(by_source_cellid))[:10]
+    raise ValueError(
+        f"Could not link current {marker_name} objects to the stored nuclear "
+        "assignment. The current objects matched neither the source marker "
+        "ObjectIDs nor source CellIDs.\n"
+        f"First unmatched current IDs vs marker IDs: {missing_marker}\n"
+        f"First unmatched current IDs vs source CellIDs: {missing_cellid}\n"
+        f"Source HDF5: {source_info['results_file']}"
+    )
+
+
+if ENABLE_NUCLEAR_ALL_CELL_SUMMARY:
+    if (
+        OBJECT_A_NUCLEAR_RESULTS_FILE is None
+        or OBJECT_B_NUCLEAR_RESULTS_FILE is None
+    ):
+        print(
+            "\nNuclear all-cell summary requested, but one or both source "
+            "marker-vs-nuclear HDF5 paths are None. Skipping all-cell summary.\n"
+            "Set OBJECT_A_NUCLEAR_RESULTS_FILE and "
+            "OBJECT_B_NUCLEAR_RESULTS_FILE to the original first-stage HDF5s."
+        )
+        nuclear_summary_completed = False
+
+    else:
+        print()
+        print("=" * 70)
+        print("CREATING ALL-CELL SUMMARY FROM STORED NUCLEAR ASSIGNMENTS")
+        print("=" * 70)
+
+        source_a = _load_source_nuclear_assignment_h5(
+            OBJECT_A_NUCLEAR_RESULTS_FILE,
+            OBJECT_A_NAME,
+        )
+        source_b = _load_source_nuclear_assignment_h5(
+            OBJECT_B_NUCLEAR_RESULTS_FILE,
+            OBJECT_B_NAME,
+        )
+
+        print(
+            f"{OBJECT_A_NAME} nuclear source: "
+            f"{source_a['results_file']}"
+        )
+        print(
+            f"{OBJECT_B_NAME} nuclear source: "
+            f"{source_b['results_file']}"
+        )
+
+        nuclear_ids_a = set(source_a["nuclear_ids"])
+        nuclear_ids_b = set(source_b["nuclear_ids"])
+
+        # ------------------------------------------------------------
+        # Establish one canonical ALL-NUCLEUS denominator.
+        # ------------------------------------------------------------
+        # The two first-stage runs may have used differently filtered
+        # versions of the SAME nuclear segmentation.  If one nuclear-ID
+        # set is a strict subset of the other, their ID namespace is still
+        # compatible and the union (equivalently the larger set) is the
+        # correct all-cell denominator.
+        #
+        # If the two sets are non-nested, stop rather than silently mixing
+        # potentially different nuclear segmentations.
+        if nuclear_ids_a == nuclear_ids_b:
+            canonical_nuclear_ids = nuclear_ids_a
+            nuclear_denominator_method = "identical_source_nuclear_sets"
+        elif nuclear_ids_a.issubset(nuclear_ids_b) or nuclear_ids_b.issubset(nuclear_ids_a):
+            if not ALLOW_NESTED_NUCLEAR_OBJECT_SETS:
+                raise ValueError(
+                    "The marker-vs-nuclear source HDF5 files contain nested "
+                    "but non-identical nuclear ObjectID populations, and "
+                    "ALLOW_NESTED_NUCLEAR_OBJECT_SETS is False."
+                )
+            canonical_nuclear_ids = nuclear_ids_a | nuclear_ids_b
+            nuclear_denominator_method = "nested_source_nuclear_sets_union"
+            smaller_name = (
+                OBJECT_A_NAME if len(nuclear_ids_a) < len(nuclear_ids_b)
+                else OBJECT_B_NAME
+            )
+            larger_name = (
+                OBJECT_B_NAME if len(nuclear_ids_a) < len(nuclear_ids_b)
+                else OBJECT_A_NAME
+            )
+            print(
+                "NOTE: source nuclear populations are nested rather than "
+                "identical; using the union/larger canonical nuclear set "
+                f"as the all-cell denominator ({len(canonical_nuclear_ids):,} nuclei)."
+            )
+            print(
+                f"  {smaller_name} source nuclear IDs are a subset of "
+                f"{larger_name} source nuclear IDs."
+            )
+        else:
+            only_a = sorted(nuclear_ids_a - nuclear_ids_b)
+            only_b = sorted(nuclear_ids_b - nuclear_ids_a)
+            raise ValueError(
+                "The two marker-vs-nuclear source HDF5 files contain "
+                "non-nested nuclear ObjectID populations. This may indicate "
+                "different nuclear segmentations or incompatible ID namespaces.\n"
+                f"{OBJECT_A_NAME} source nuclear count: {len(nuclear_ids_a):,}\n"
+                f"{OBJECT_B_NAME} source nuclear count: {len(nuclear_ids_b):,}\n"
+                f"Only in {OBJECT_A_NAME} source (first 10): {only_a[:10]}\n"
+                f"Only in {OBJECT_B_NAME} source (first 10): {only_b[:10]}"
+            )
+
+        # ------------------------------------------------------------
+        # IMPORTANT: use the ORIGINAL stored marker->nucleus assignments
+        # directly.  Do NOT require every object in the current LHX6/PV
+        # analysis to map back to a nucleus.
+        # ------------------------------------------------------------
+        # The current marker-vs-marker run can contain ROIs that were not
+        # retained in the earlier marker-vs-nuclear gate.  Those objects
+        # correctly have no stored canonical nuclear assignment and should
+        # not cause the all-cell summary to fail.
+        #
+        # Positivity for the all-cell table therefore means:
+        #     A+ = nucleus appears in the final A<->nuclear source mapping
+        #     B+ = nucleus appears in the final B<->nuclear source mapping
+        # ------------------------------------------------------------
+        a_source_mapping = source_a["mapping"].copy()
+        b_source_mapping = source_b["mapping"].copy()
+
+        if a_source_mapping["Nuclear_ObjectID"].duplicated().any():
+            raise ValueError(
+                f"The stored {OBJECT_A_NAME}-vs-nuclear mapping contains "
+                "multiple marker assignments to the same canonical nucleus."
+            )
+        if b_source_mapping["Nuclear_ObjectID"].duplicated().any():
+            raise ValueError(
+                f"The stored {OBJECT_B_NAME}-vs-nuclear mapping contains "
+                "multiple marker assignments to the same canonical nucleus."
+            )
+
+        a_positive_nuclear_ids = set(
+            a_source_mapping["Nuclear_ObjectID"].astype(int)
+        )
+        b_positive_nuclear_ids = set(
+            b_source_mapping["Nuclear_ObjectID"].astype(int)
+        )
+
+        if not a_positive_nuclear_ids.issubset(canonical_nuclear_ids):
+            raise ValueError(
+                f"Stored {OBJECT_A_NAME} positive nuclear IDs extend outside "
+                "the canonical nuclear population."
+            )
+        if not b_positive_nuclear_ids.issubset(canonical_nuclear_ids):
+            raise ValueError(
+                f"Stored {OBJECT_B_NAME} positive nuclear IDs extend outside "
+                "the canonical nuclear population."
+            )
+
+        a_by_nucleus = {
+            int(row["Nuclear_ObjectID"]): row
+            for _, row in a_source_mapping.iterrows()
+        }
+        b_by_nucleus = {
+            int(row["Nuclear_ObjectID"]): row
+            for _, row in b_source_mapping.iterrows()
+        }
+
+        nuclear_rows = []
+        for nuclear_id in sorted(int(x) for x in canonical_nuclear_ids):
+            a_row = a_by_nucleus.get(nuclear_id)
+            b_row = b_by_nucleus.get(nuclear_id)
+
+            a_positive = a_row is not None
+            b_positive = b_row is not None
+            class_label = (
+                f"{OBJECT_A_NAME}{'+' if a_positive else '-'}"
+                f"/{OBJECT_B_NAME}{'+' if b_positive else '-'}"
+            )
+
+            nuclear_rows.append(
+                {
+                    "Nuclear_ObjectID": nuclear_id,
+                    "Nuclear_Marker": source_a["nuclear_name"],
+                    "Nuclear_Denominator_Method": nuclear_denominator_method,
+                    "Object_A_Name": OBJECT_A_NAME,
+                    "Object_A_Positive": bool(a_positive),
+                    "Object_A_Current_ObjectID": np.nan,
+                    "Object_A_Source_Marker_ObjectID": (
+                        int(a_row["Source_Marker_ObjectID"])
+                        if a_row is not None else np.nan
+                    ),
+                    "Object_A_Source_CellID": (
+                        int(a_row["Source_CellID"])
+                        if a_row is not None else np.nan
+                    ),
+                    "Object_A_Source_Link_Method": (
+                        "direct_first_stage_marker_to_nucleus_assignment"
+                        if a_row is not None else ""
+                    ),
+                    "Object_B_Name": OBJECT_B_NAME,
+                    "Object_B_Positive": bool(b_positive),
+                    "Object_B_Current_ObjectID": np.nan,
+                    "Object_B_Source_Marker_ObjectID": (
+                        int(b_row["Source_Marker_ObjectID"])
+                        if b_row is not None else np.nan
+                    ),
+                    "Object_B_Source_CellID": (
+                        int(b_row["Source_CellID"])
+                        if b_row is not None else np.nan
+                    ),
+                    "Object_B_Source_Link_Method": (
+                        "direct_first_stage_marker_to_nucleus_assignment"
+                        if b_row is not None else ""
+                    ),
+                    "Class": class_label,
+                }
+            )
+
+        nuclear_cell_df = pd.DataFrame(nuclear_rows)
+        nuclear_cell_df.to_csv(
+            nuclear_cell_classification_csv,
+            index=False,
+        )
+
+        all_cell_labels = [
+            f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+",
+            f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-",
+            f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+",
+            f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}-",
+        ]
+
+        all_cell_counts = {
+            label: int((nuclear_cell_df["Class"] == label).sum())
+            for label in all_cell_labels
+        }
+        n_all_nuclear_cells = int(len(nuclear_cell_df))
+
+        all_cell_class_counts_df = pd.DataFrame(
+            [
+                {
+                    "Class": label,
+                    "Count": all_cell_counts[label],
+                    "Percent_of_All_Nuclear_Cells": _safe_percent(
+                        all_cell_counts[label], n_all_nuclear_cells
+                    ),
+                }
+                for label in all_cell_labels
+            ]
+        )
+        all_cell_class_counts_df.to_csv(
+            all_cell_class_counts_csv,
+            index=False,
+        )
+
+        summary_metrics_record.update(
+            {
+                "All_Cell_Assignment_Source": (
+                    "direct_preexisting_marker_vs_nuclear_HDF5_assignments"
+                ),
+                "All_Cell_Object_A_Nuclear_Source_H5": str(
+                    source_a["results_file"]
+                ),
+                "All_Cell_Object_B_Nuclear_Source_H5": str(
+                    source_b["results_file"]
+                ),
+                "All_Cell_Nuclear_Marker": source_a["nuclear_name"],
+                "All_Cell_Nuclear_Denominator_Method": nuclear_denominator_method,
+                "All_Cell_Total_Nuclear_Cells": n_all_nuclear_cells,
+                "All_Cell_Double_Positive_Label": (
+                    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+"
+                ),
+                "All_Cell_Double_Positive_Count": all_cell_counts[
+                    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+"
+                ],
+                "All_Cell_Double_Positive_Percent": _safe_percent(
+                    all_cell_counts[f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+"],
+                    n_all_nuclear_cells,
+                ),
+                "All_Cell_Object_A_Only_Label": (
+                    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-"
+                ),
+                "All_Cell_Object_A_Only_Count": all_cell_counts[
+                    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-"
+                ],
+                "All_Cell_Object_A_Only_Percent": _safe_percent(
+                    all_cell_counts[f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-"],
+                    n_all_nuclear_cells,
+                ),
+                "All_Cell_Object_B_Only_Label": (
+                    f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+"
+                ),
+                "All_Cell_Object_B_Only_Count": all_cell_counts[
+                    f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+"
+                ],
+                "All_Cell_Object_B_Only_Percent": _safe_percent(
+                    all_cell_counts[f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+"],
+                    n_all_nuclear_cells,
+                ),
+                "All_Cell_Double_Negative_Label": (
+                    f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}-"
+                ),
+                "All_Cell_Double_Negative_Count": all_cell_counts[
+                    f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}-"
+                ],
+                "All_Cell_Double_Negative_Percent": _safe_percent(
+                    all_cell_counts[f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}-"],
+                    n_all_nuclear_cells,
+                ),
+            }
+        )
+
+        nuclear_summary_completed = True
+
+        print(
+            f"\nCanonical nuclear cells: {n_all_nuclear_cells:,}"
+        )
+        for label in all_cell_labels:
+            count = all_cell_counts[label]
+            pct = _safe_percent(count, n_all_nuclear_cells)
+            print(f"  {label}: {count:,} ({pct:.2f}%)")
+
+        print(
+            f"Per-nucleus classification CSV: "
+            f"{nuclear_cell_classification_csv}"
+        )
+        print(
+            f"All-cell class-count CSV: {all_cell_class_counts_csv}"
+        )
+else:
+    nuclear_summary_completed = False
+
+
+summary_metrics_df = pd.DataFrame([summary_metrics_record])
+summary_metrics_df.to_csv(
+    summary_metrics_csv,
+    index=False
 )
+
+print(
+    f"\nFinal marker-positive classes: "
+    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}+={n_double_positive:,}, "
+    f"{OBJECT_A_NAME}+/{OBJECT_B_NAME}-={n_a_only:,}, "
+    f"{OBJECT_A_NAME}-/{OBJECT_B_NAME}+={n_b_only:,}"
+)
+print(f"Summary metrics CSV: {summary_metrics_csv}")
 
 
 # ------------------------------------------------------------
@@ -4581,6 +5458,9 @@ for _path in [
     b_only_metrics_csv,
     unmatched_class_metrics_csv,
     class_counts_csv,
+    summary_metrics_csv,
+    nuclear_cell_classification_csv,
+    all_cell_class_counts_csv,
     class_bin_summary_csv,
     a_only_metric_intensity_pdf,
     b_only_metric_intensity_pdf,
@@ -4621,6 +5501,9 @@ for path in [
     b_only_metrics_csv,
     unmatched_class_metrics_csv,
     class_counts_csv,
+    summary_metrics_csv,
+    nuclear_cell_classification_csv,
+    all_cell_class_counts_csv,
     class_bin_summary_csv,
     a_only_metric_intensity_pdf,
     b_only_metric_intensity_pdf

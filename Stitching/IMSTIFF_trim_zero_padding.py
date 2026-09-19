@@ -370,6 +370,7 @@ run(\"Optimize globally and apply shifts ...\",
 //    registered overlap pixels. This is intentionally done AFTER
 //    BaSiC and AFTER spatial registration, immediately before fusion.
 // ============================================================
+print(\"BIGSTITCHER_INTENSITY_ADJUSTMENT_START\");
 run(\"Adjust Intensities\",
     \"select={base}/dataset.xml \" +
     \"process_angle=[All angles] process_channel=[All channels] \" +
